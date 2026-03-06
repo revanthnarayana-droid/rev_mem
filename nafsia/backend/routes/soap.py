@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from datetime import datetime
 from store.session_store import store
 from websocket.manager import manager
-from websocket.events import SOAP_READY
+from websocket.events import SOAP_READY, TIMELINE_EVENT
 
 load_dotenv()
 router = APIRouter()
@@ -42,7 +42,7 @@ async def generate_soap(req: SOAPRequest):
     if not session:
         return {"error": "Session not found"}
 
-    user_msgs = [m["content"] for m in session["messages"] if m["role"] == "user"][-8:]
+    user_msgs = [m["content"] for m in session["messages"] if m["role"] in {"user", "patient"}][-8:]
     patient_text = " | ".join(user_msgs)
 
     prompt = (
@@ -122,7 +122,16 @@ async def generate_soap(req: SOAPRequest):
     soap["risk_flag"] = session["peak_risk_score"] >= 7.0 or session["crisis_occurred"]
 
     store.save_soap(req.session_id, soap)
+    timeline_event = store.add_timeline_event(
+        req.session_id, "soap_generated", "SOAP note generated", mode=session["session_mode"]
+    )
     await manager.send_to_counselors(req.session_id, {
         "type": SOAP_READY, "session_id": req.session_id, "soap": soap
     })
+    if timeline_event:
+        await manager.send_to_counselors(req.session_id, {
+            "type": TIMELINE_EVENT,
+            "session_id": req.session_id,
+            "event": timeline_event,
+        })
     return soap

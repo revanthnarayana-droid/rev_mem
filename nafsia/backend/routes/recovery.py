@@ -5,7 +5,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from store.session_store import store
 from websocket.manager import manager
-from websocket.events import RECOVERY_READY
+from websocket.events import RECOVERY_READY, TIMELINE_EVENT
 
 load_dotenv()
 router = APIRouter()
@@ -25,7 +25,7 @@ async def generate_recovery(req: RecoveryRequest):
     if not session:
         return {"error": "Session not found"}
 
-    user_msgs = [m["content"] for m in session["messages"] if m["role"] == "user"][-10:]
+    user_msgs = [m["content"] for m in session["messages"] if m["role"] in {"user", "patient"}][-10:]
     summary = " ".join(user_msgs)[:500]
     emotion = session["primary_emotion"]
     technique = session["dominant_technique"]
@@ -38,7 +38,8 @@ async def generate_recovery(req: RecoveryRequest):
         f"Return ONLY valid JSON with exactly these keys: "
         f"breathing_technique_name, breathing_exercise, journaling_prompt, "
         f"resource_title, resource_description, affirmation (under 12 words), "
-        f"session_summary (2 warm sentences to the patient). "
+        f"session_summary (2 warm sentences to the patient), micro_plan, "
+        f"stabilizer_summary, tone, visual_theme. "
         f"No markdown. No explanation. JSON only."
     )
 
@@ -60,10 +61,26 @@ async def generate_recovery(req: RecoveryRequest):
             "resource_description": "Free confidential mental health support in India.",
             "affirmation": "You showed up today. That took courage.",
             "session_summary": "You explored some difficult feelings today. That takes real strength.",
+            "micro_plan": "Drink water, take five steady breaths, text one trusted person, and rest away from intense triggers tonight.",
+            "stabilizer_summary": "Structured breathing and slowing down your thoughts seemed to create a little space in the session.",
+            "tone": "grounded",
+            "visual_theme": "dawn",
         }
 
     store.save_recovery(req.session_id, recovery)
+    timeline_event = store.add_timeline_event(
+        req.session_id, "recovery_ready", "Recovery canvas generated", mode=session["session_mode"]
+    )
     await manager.send_to_counselors(req.session_id, {
         "type": RECOVERY_READY, "session_id": req.session_id, "recovery": recovery
     })
+    await manager.send_to_patient(req.session_id, {
+        "type": RECOVERY_READY, "session_id": req.session_id, "recovery": recovery
+    })
+    if timeline_event:
+        await manager.send_to_counselors(req.session_id, {
+            "type": TIMELINE_EVENT,
+            "session_id": req.session_id,
+            "event": timeline_event,
+        })
     return recovery

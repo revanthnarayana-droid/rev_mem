@@ -14,13 +14,23 @@ export async function analyzeMessage(message, sessionId) {
   return post("/analyze", { message, session_id: sessionId });
 }
 
-export async function sendChatMessage({ message, sessionId, technique, emotion, riskScore }) {
+export async function sendChatMessage({
+  message,
+  sessionId,
+  technique,
+  emotion,
+  riskScore,
+  draftOnly,
+  audience,
+}) {
   return post("/chat", {
     message,
     session_id: sessionId,
     technique: technique || "ROGERIAN",
     emotion: emotion || "neutral",
     risk_score: riskScore || 0.0,
+    draft_only: !!draftOnly,
+    audience: audience || "patient",
   });
 }
 

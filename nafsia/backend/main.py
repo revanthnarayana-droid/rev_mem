@@ -4,6 +4,7 @@ from websocket.manager import manager
 from websocket.events import *
 from routes import chat, analyze, recovery, soap, sos
 from store.session_store import store
+import asyncio
 import json
 
 app = FastAPI(title="NAFSIA")
@@ -32,11 +33,17 @@ async def start_session(data: dict):
     mood = data.get("mood", "unknown")
     baseline = data.get("baseline_score", 5.0)
     store.create_session(session_id, mood, baseline)
+    timeline_event = store.get_timeline_events(session_id)[-1]
     await manager.broadcast_to_all_counselors({
         "type": "session_started",
         "session_id": session_id,
         "patient_mood": mood,
         "baseline_score": baseline
+    })
+    await manager.broadcast_to_all_counselors({
+        "type": TIMELINE_EVENT,
+        "session_id": session_id,
+        "event": timeline_event,
     })
     return {"status": "created", "session_id": session_id}
 
@@ -44,6 +51,11 @@ async def start_session(data: dict):
 @app.websocket("/ws/patient/{session_id}")
 async def patient_ws(ws: WebSocket, session_id: str):
     await manager.connect_patient(session_id, ws)
+    for event in store.get_timeline_events(session_id):
+        await manager.send_to_patient(
+            session_id,
+            {"type": TIMELINE_EVENT, "session_id": session_id, "event": event},
+        )
     await manager.send_to_counselors(
         session_id, {"type": SESSION_STARTED, "session_id": session_id}
     )
@@ -59,13 +71,29 @@ async def patient_ws(ws: WebSocket, session_id: str):
                     "role": "patient",
                     "content": msg.get("content", ""),
                     "analysis": msg.get("analysis", {}),
+                    "timestamp": msg.get("timestamp"),
                 },
             )
     except WebSocketDisconnect:
         manager.disconnect_patient(session_id)
-        await manager.send_to_counselors(
-            session_id, {"type": SESSION_ENDED, "session_id": session_id}
-        )
+        await asyncio.sleep(2.0)
+        session = manager.sessions.get(session_id, {})
+        if session.get("patient") is None:
+            timeline_event = store.add_timeline_event(
+                session_id, "session_ended", "Patient disconnected", mode=store.get_session_mode(session_id)
+            )
+            await manager.send_to_counselors(
+                session_id, {"type": SESSION_ENDED, "session_id": session_id}
+            )
+            if timeline_event:
+                await manager.send_to_counselors(
+                    session_id,
+                    {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                )
+                await manager.send_to_patient(
+                    session_id,
+                    {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                )
 
 
 @app.websocket("/ws/counselor/{session_id}")
@@ -77,20 +105,48 @@ async def counselor_ws(ws: WebSocket, session_id: str):
             msg = json.loads(data)
             t = msg.get("type")
             if t == COUNSELOR_JOINED:
-                store.set_session_mode(session_id, "human")
+                mode = msg.get("mode", "human")
+                if mode not in {"ai", "copilot", "human"}:
+                    mode = "human"
+                store.set_session_mode(session_id, mode)
+                timeline_event = store.add_timeline_event(
+                    session_id,
+                    "intervention_mode_changed",
+                    f"Counselor switched session to {mode}",
+                    mode=mode,
+                )
                 await manager.send_to_patient(
                     session_id,
                     {
                         "type": SESSION_MODE_CHANGED,
-                        "mode": "human",
-                        "message": "A counselor has joined your session.",
+                        "mode": mode,
+                        "message": "A counselor has joined your session."
+                        if mode == "human"
+                        else "A counselor is quietly co-piloting your session.",
                     },
                 )
                 await manager.send_to_counselors(
-                    session_id, {"type": COUNSELOR_JOINED, "session_id": session_id}
+                    session_id,
+                    {
+                        "type": COUNSELOR_JOINED,
+                        "session_id": session_id,
+                        "mode": mode,
+                    },
                 )
+                if timeline_event:
+                    await manager.send_to_counselors(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
+                    await manager.send_to_patient(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
             elif t == COUNSELOR_LEFT:
                 store.set_session_mode(session_id, "ai")
+                timeline_event = store.add_timeline_event(
+                    session_id, "intervention_mode_changed", "AI resumed the session", mode="ai"
+                )
                 await manager.send_to_patient(
                     session_id,
                     {
@@ -99,6 +155,18 @@ async def counselor_ws(ws: WebSocket, session_id: str):
                         "message": "Your AI companion has resumed.",
                     },
                 )
+                await manager.send_to_counselors(
+                    session_id, {"type": COUNSELOR_LEFT, "session_id": session_id}
+                )
+                if timeline_event:
+                    await manager.send_to_counselors(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
+                    await manager.send_to_patient(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
             elif t == COUNSELOR_MESSAGE:
                 await manager.send_to_patient(
                     session_id,
@@ -120,20 +188,48 @@ async def counselor_hub(ws: WebSocket):
             if not session_id:
                 continue
             if t == COUNSELOR_JOINED:
-                store.set_session_mode(session_id, "human")
+                mode = msg.get("mode", "human")
+                if mode not in {"ai", "copilot", "human"}:
+                    mode = "human"
+                store.set_session_mode(session_id, mode)
+                timeline_event = store.add_timeline_event(
+                    session_id,
+                    "intervention_mode_changed",
+                    f"Counselor switched session to {mode}",
+                    mode=mode,
+                )
                 await manager.send_to_patient(
                     session_id,
                     {
                         "type": SESSION_MODE_CHANGED,
-                        "mode": "human",
-                        "message": "A counselor has joined your session.",
+                        "mode": mode,
+                        "message": "A counselor has joined your session."
+                        if mode == "human"
+                        else "A counselor is quietly co-piloting your session.",
                     },
                 )
                 await manager.send_to_counselors(
-                    session_id, {"type": COUNSELOR_JOINED, "session_id": session_id}
+                    session_id,
+                    {
+                        "type": COUNSELOR_JOINED,
+                        "session_id": session_id,
+                        "mode": mode,
+                    },
                 )
+                if timeline_event:
+                    await manager.send_to_counselors(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
+                    await manager.send_to_patient(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
             elif t == COUNSELOR_LEFT:
                 store.set_session_mode(session_id, "ai")
+                timeline_event = store.add_timeline_event(
+                    session_id, "intervention_mode_changed", "AI resumed the session", mode="ai"
+                )
                 await manager.send_to_patient(
                     session_id,
                     {
@@ -142,6 +238,18 @@ async def counselor_hub(ws: WebSocket):
                         "message": "Your AI companion has resumed.",
                     },
                 )
+                await manager.send_to_counselors(
+                    session_id, {"type": COUNSELOR_LEFT, "session_id": session_id}
+                )
+                if timeline_event:
+                    await manager.send_to_counselors(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
+                    await manager.send_to_patient(
+                        session_id,
+                        {"type": TIMELINE_EVENT, "session_id": session_id, "event": timeline_event},
+                    )
             elif t == COUNSELOR_MESSAGE:
                 await manager.send_to_patient(
                     session_id,

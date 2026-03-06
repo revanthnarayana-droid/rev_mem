@@ -9,6 +9,7 @@ class NAFSIASocket {
     this.reconnectAttempts = 0;
     this.maxReconnects = 5;
     this._reconnectUrl = null;
+    this._manualClose = false;
   }
 
   connectPatient(sessionId) {
@@ -30,13 +31,18 @@ class NAFSIASocket {
 
   _connect(url) {
     this._reconnectUrl = url;
-    if (this.ws) this.ws.close();
+    this._manualClose = false;
+    if (this.ws) {
+      this._manualClose = true;
+      this.ws.close();
+    }
     console.log("[NAFSIA WS] Connecting to", url);
     this.ws = new WebSocket(url);
 
     this.ws.onopen = () => {
       console.log("[NAFSIA WS] Connected");
       this.reconnectAttempts = 0;
+      this._manualClose = false;
       this._emit("connected", {});
     };
 
@@ -53,7 +59,7 @@ class NAFSIASocket {
 
     this.ws.onclose = () => {
       this._emit("disconnected", {});
-      if (this.reconnectAttempts < this.maxReconnects) {
+      if (!this._manualClose && this.reconnectAttempts < this.maxReconnects) {
         this.reconnectAttempts++;
         setTimeout(() => this._connect(url), this.reconnectAttempts * 1500);
       }
@@ -82,7 +88,11 @@ class NAFSIASocket {
   }
 
   disconnect() {
-    if (this.ws) { this.ws.close(); this.ws = null; }
+    if (this.ws) {
+      this._manualClose = true;
+      this.ws.close();
+      this.ws = null;
+    }
   }
 
   get isConnected() {
@@ -108,4 +118,6 @@ export const WS_EVENTS = {
   COUNSELOR_LEFT: "counselor_left",
   COUNSELOR_MESSAGE: "counselor_message",
   SESSION_MODE_CHANGED: "session_mode_changed",
+  TIMELINE_EVENT: "timeline_event",
+  COPILOT_DRAFT_READY: "copilot_draft_ready",
 };

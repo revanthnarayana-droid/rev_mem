@@ -12,7 +12,7 @@ from models.velocity_tracker import VelocityTracker
 from models.technique_router import TechniqueRouter
 from utils.risk_formula import compute_full_risk, get_risk_tier
 from websocket.manager import manager
-from websocket.events import ANALYSIS_UPDATE, ALERT_TIER1, ALERT_TIER2, ALERT_TIER3, SILENT_SIGNAL
+from websocket.events import ANALYSIS_UPDATE, ALERT_TIER1, ALERT_TIER2, ALERT_TIER3, SILENT_SIGNAL, TIMELINE_EVENT
 from store.session_store import store
 
 router = APIRouter()
@@ -149,9 +149,51 @@ async def analyze(req: AnalyzeRequest):
         "silent_signal": silent["silent_signal"],
         "silent_signal_reason": silent["reason"],
         "updated_score_history": updated_history,
+        "session_mode": store.get_session_mode(req.session_id),
     }
 
     store.append_message(req.session_id, "patient", req.message, response)
+    timeline_events = []
+    if len(score_history) == 0:
+        event = store.add_timeline_event(
+            req.session_id,
+            "first_spike",
+            f"First measured risk landed at {risk_score}/10",
+            score=risk_score,
+            mode=response["session_mode"],
+        )
+        if event:
+            timeline_events.append(event)
+    if risk_score >= 7.5:
+        event = store.add_timeline_event(
+            req.session_id,
+            "tier_3_alert",
+            "Tier 3 crisis alert triggered",
+            score=risk_score,
+            mode=response["session_mode"],
+        )
+        if event:
+            timeline_events.append(event)
+    elif risk_score >= 6.0:
+        event = store.add_timeline_event(
+            req.session_id,
+            "tier_2_alert",
+            "Tier 2 concern alert triggered",
+            score=risk_score,
+            mode=response["session_mode"],
+        )
+        if event:
+            timeline_events.append(event)
+    elif risk_score >= 4.0:
+        event = store.add_timeline_event(
+            req.session_id,
+            "tier_1_alert",
+            "Tier 1 watch alert triggered",
+            score=risk_score,
+            mode=response["session_mode"],
+        )
+        if event:
+            timeline_events.append(event)
 
     await manager.send_to_counselors(req.session_id, {
         "type": ANALYSIS_UPDATE,
@@ -178,10 +220,37 @@ async def analyze(req: AnalyzeRequest):
         })
 
     if silent["silent_signal"]:
+        event = store.add_timeline_event(
+            req.session_id,
+            "silent_signal",
+            silent["reason"],
+            score=risk_score,
+            mode=response["session_mode"],
+        )
         await manager.send_to_counselors(req.session_id, {
             "type": SILENT_SIGNAL,
             "session_id": req.session_id,
             "reason": silent["reason"]
         })
+        if event:
+            timeline_events.append(event)
+
+    for event in timeline_events:
+        await manager.send_to_counselors(
+            req.session_id,
+            {
+                "type": TIMELINE_EVENT,
+                "session_id": req.session_id,
+                "event": event,
+            },
+        )
+        await manager.send_to_patient(
+            req.session_id,
+            {
+                "type": TIMELINE_EVENT,
+                "session_id": req.session_id,
+                "event": event,
+            },
+        )
 
     return response

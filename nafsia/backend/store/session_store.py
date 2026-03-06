@@ -28,8 +28,17 @@ class SessionStore:
             "soap_note": None,
             "recovery_card": None,
             "cognitive_distortions_seen": set(),
+            "timeline_events": [],
+            "copilot_drafts": [],
         }
         self.sessions[session_id] = session
+        self.add_timeline_event(
+            session_id,
+            "baseline_selected",
+            f"Baseline set to {patient_mood}",
+            score=baseline_score,
+            mode="ai",
+        )
         return session
 
     def get_session(self, session_id) -> Optional[dict]:
@@ -77,6 +86,43 @@ class SessionStore:
             session["velocity_history"].append(analysis.get("velocity", 0.0))
         return msg
 
+    def add_timeline_event(self, session_id, event_type, summary, score=None, mode=None):
+        session = self.get_session(session_id)
+        if not session:
+            return None
+        now = datetime.utcnow()
+        previous = session["timeline_events"][-1] if session["timeline_events"] else None
+        if previous and previous["type"] == event_type and previous["summary"] == summary:
+            try:
+                previous_time = datetime.fromisoformat(previous["timestamp"])
+            except ValueError:
+                previous_time = None
+            if previous_time and (now - previous_time).total_seconds() < 3:
+                if score is not None:
+                    previous["score"] = score
+                if mode is not None:
+                    previous["mode"] = mode
+                return previous
+        event = {
+            "id": str(uuid.uuid4())[:8],
+            "type": event_type,
+            "session_id": session_id,
+            "timestamp": now.isoformat(),
+            "summary": summary,
+        }
+        if score is not None:
+            event["score"] = score
+        if mode is not None:
+            event["mode"] = mode
+        session["timeline_events"].append(event)
+        return event
+
+    def get_timeline_events(self, session_id) -> List[dict]:
+        session = self.get_session(session_id)
+        if not session:
+            return []
+        return list(session["timeline_events"])
+
     def set_session_mode(self, session_id, mode):
         s = self.get_session(session_id)
         if s:
@@ -101,6 +147,23 @@ class SessionStore:
         s = self.get_session(session_id)
         if s:
             s["recovery_card"] = recovery
+
+    def save_copilot_draft(self, session_id, draft):
+        s = self.get_session(session_id)
+        if s:
+            s["copilot_drafts"].append(
+                {
+                    "id": str(uuid.uuid4())[:8],
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "draft": draft,
+                }
+            )
+
+    def get_copilot_drafts(self, session_id) -> List[dict]:
+        s = self.get_session(session_id)
+        if not s:
+            return []
+        return list(s["copilot_drafts"])
 
     def get_chat_history(self, session_id, last_n=10) -> List[dict]:
         s = self.get_session(session_id)
@@ -127,6 +190,7 @@ class SessionStore:
                 "crisis_occurred": s["crisis_occurred"],
                 "session_mode": s["session_mode"],
                 "message_count": len(s["messages"]),
+                "timeline_event_count": len(s["timeline_events"]),
             }
             for sid, s in self.sessions.items()
         ]

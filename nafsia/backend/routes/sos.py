@@ -2,7 +2,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel
 from datetime import datetime
 from websocket.manager import manager
-from websocket.events import SOS_FIRED
+from websocket.events import SOS_FIRED, TIMELINE_EVENT
 from store.session_store import store
 
 router = APIRouter()
@@ -16,6 +16,9 @@ class SOSRequest(BaseModel):
 @router.post("/sos")
 async def trigger_sos(req: SOSRequest):
     store.flag_sos(req.session_id)
+    timeline_event = store.add_timeline_event(
+        req.session_id, "sos_fired", req.message, mode=store.get_session_mode(req.session_id)
+    )
 
     helplines = [
         {"name": "iCall", "number": "9152987821", "hours": "Mon-Sat 8am-10pm"},
@@ -32,6 +35,17 @@ async def trigger_sos(req: SOSRequest):
         "helplines": helplines,
         "severity": "EMERGENCY"
     })
+    if timeline_event:
+        await manager.broadcast_to_all_counselors({
+            "type": TIMELINE_EVENT,
+            "session_id": req.session_id,
+            "event": timeline_event,
+        })
+        await manager.send_to_patient(req.session_id, {
+            "type": TIMELINE_EVENT,
+            "session_id": req.session_id,
+            "event": timeline_event,
+        })
 
     return {
         "acknowledged": True,

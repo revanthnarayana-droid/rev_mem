@@ -1,49 +1,38 @@
 import { useState, useEffect, useRef } from "react";
 import { socket, WS_EVENTS } from "../ws/socket";
 import { analyzeMessage, sendChatMessage, triggerSOS } from "../api/nafsia";
-
-const TIER_SURFACES = {
-  safe: {
-    base: "#edf4fb",
-    glow: "radial-gradient(circle at top left, rgba(125, 211, 252, 0.22), transparent 24%)",
-  },
-  watch: {
-    base: "#f8f4df",
-    glow: "radial-gradient(circle at top left, rgba(244, 210, 122, 0.22), transparent 24%)",
-  },
-  concern: {
-    base: "#faede5",
-    glow: "radial-gradient(circle at top left, rgba(255, 159, 110, 0.2), transparent 24%)",
-  },
-  crisis: {
-    base: "#f8e8ea",
-    glow: "radial-gradient(circle at top left, rgba(244, 163, 190, 0.22), transparent 24%)",
-  },
-};
-
-const TECHNIQUE_COLORS = {
-  CBT: "#4A9EFF",
-  DBT: "#FF6B35",
-  MI: "#00FFB2",
-  ROGERIAN: "#A855F7",
-};
-
-function deriveCurrentMood(analysis, fallbackMood) {
-  if (!analysis?.emotion) return fallbackMood || "--";
-  const emotion = analysis.emotion;
-  if (emotion === "joy") return "great";
-  if (emotion === "neutral") return "okay";
-  if (emotion === "sadness") return "low";
-  if (emotion === "fear") return "really low";
-  if (emotion === "anger") return "low";
-  return emotion;
-}
+import { buildSceneModel, sessionArcLabels } from "../utils/sceneModel";
+import RecoveryCanvas from "../components/RecoveryCanvas";
 
 function formatTime() {
   return new Date().toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });
+}
+
+function deriveDetectedMood(analysis, fallbackMood) {
+  if (!analysis?.emotion) return fallbackMood || "--";
+  const map = {
+    joy: "great",
+    neutral: "okay",
+    sadness: "low",
+    fear: "really low",
+    anger: "low",
+  };
+  return map[analysis.emotion] || analysis.emotion;
+}
+
+function mergeTimelineEvents(current, incoming) {
+  const merged = [...current];
+  for (const event of incoming) {
+    if (!event?.id) continue;
+    if (merged.some((item) => item.id === event.id)) continue;
+    merged.push(event);
+  }
+  return merged.sort(
+    (left, right) => new Date(left.timestamp).getTime() - new Date(right.timestamp).getTime()
+  );
 }
 
 function TypingIndicator() {
@@ -62,10 +51,32 @@ function TypingIndicator() {
   );
 }
 
-function CopingSupport({ copingEmotion, riskTier }) {
+function WeatherLayer({ scene }) {
+  return (
+    <>
+      <div
+        style={{
+          ...styles.weatherBlob,
+          background: scene.haze,
+          filter: `blur(${30 + scene.motion * 28}px)`,
+          transform: `scale(${1 + scene.motion * 0.05})`,
+        }}
+      />
+      <div
+        style={{
+          ...styles.weatherBeam,
+          opacity: 0.3 + scene.motion * 0.18,
+          transform: `rotate(${scene.tier === "crisis" ? "-12deg" : "-6deg"})`,
+        }}
+      />
+    </>
+  );
+}
+
+function CopingSupport({ copingEmotion, riskTier, scene }) {
   if (riskTier === "crisis") {
     return (
-      <div style={styles.copingCard}>
+      <div style={{ ...styles.copingCard, borderColor: scene.accent + "55" }}>
         <div style={styles.copingTitle}>Immediate Support</div>
         <div style={styles.copingLine}>iCall 9152987821</div>
         <div style={styles.copingLine}>NIMHANS 080-46110007</div>
@@ -75,7 +86,7 @@ function CopingSupport({ copingEmotion, riskTier }) {
 
   if (copingEmotion === "fear" || copingEmotion === "anxiety") {
     return (
-      <div style={styles.copingCard}>
+      <div style={{ ...styles.copingCard, borderColor: scene.accent + "44" }}>
         <div style={styles.copingTitle}>5-4-3-2-1 Grounding</div>
         <div style={styles.copingLine}>5 things you can see</div>
         <div style={styles.copingLine}>4 things you can feel</div>
@@ -88,7 +99,7 @@ function CopingSupport({ copingEmotion, riskTier }) {
 
   if (copingEmotion === "stress" || copingEmotion === "sadness") {
     return (
-      <div style={styles.copingCard}>
+      <div style={{ ...styles.copingCard, borderColor: scene.accent + "44" }}>
         <div style={styles.copingTitle}>Box Breathing</div>
         <div style={styles.copingLine}>Inhale 4</div>
         <div style={styles.copingLine}>Hold 4</div>
@@ -107,14 +118,18 @@ export default function PatientChat({ sessionId, patientMood }) {
   const [isTyping, setIsTyping] = useState(false);
   const [analysis, setAnalysis] = useState(null);
   const [sessionMode, setSessionMode] = useState("ai");
-  const [silentSignal, setSilentSignal] = useState({
-    detected: false,
-    reason: "",
-  });
+  const [silentSignal, setSilentSignal] = useState({ detected: false, reason: "" });
   const [showSOSOverlay, setShowSOSOverlay] = useState(false);
-  const [surface, setSurface] = useState(TIER_SURFACES.safe);
   const [canDismissSOS, setCanDismissSOS] = useState(false);
+  const [timelineEvents, setTimelineEvents] = useState([]);
+  const [recovery, setRecovery] = useState(null);
+  const [showRecoveryBanner, setShowRecoveryBanner] = useState(false);
   const bottomRef = useRef(null);
+  const recoveryRef = useRef(null);
+
+  const scene = buildSceneModel(analysis, sessionMode);
+  const detectedMood = deriveDetectedMood(analysis, patientMood);
+  const arcLines = sessionArcLabels(timelineEvents);
 
   function addMessage(role, content, meta = {}) {
     setMessages((current) => [
@@ -133,7 +148,25 @@ export default function PatientChat({ sessionId, patientMood }) {
   }
 
   function addSystemMessage(content) {
-    addMessage("system", content);
+    setMessages((current) => {
+      const last = current[current.length - 1];
+      if (last?.role === "system" && last?.content === content) {
+        return current;
+      }
+      return [
+        ...current,
+        {
+          role: "system",
+          content,
+          timestamp: formatTime(),
+          emotionTag: "",
+          technique: "",
+          techniqueColor: "",
+          riskTier: "",
+          copingEmotion: "",
+        },
+      ];
+    });
   }
 
   useEffect(() => {
@@ -143,21 +176,40 @@ export default function PatientChat({ sessionId, patientMood }) {
       setSessionMode(data.mode || "ai");
       if (data.message) addSystemMessage(data.message);
     });
-
     const offCounselor = socket.on(WS_EVENTS.COUNSELOR_MESSAGE, (data) => {
       addMessage("counselor", data.content || "");
+    });
+    const offTimeline = socket.on(WS_EVENTS.TIMELINE_EVENT, (data) => {
+      if (data.session_id === sessionId && data.event) {
+        setTimelineEvents((current) => mergeTimelineEvents(current, [data.event]));
+      }
+    });
+    const offRecovery = socket.on(WS_EVENTS.RECOVERY_READY, (data) => {
+      if (data.session_id === sessionId) {
+        setRecovery(data.recovery);
+        setShowRecoveryBanner(true);
+        addSystemMessage("Your recovery canvas is ready.");
+      }
     });
 
     return () => {
       offMode();
       offCounselor();
+      offTimeline();
+      offRecovery();
       socket.disconnect();
     };
   }, [sessionId]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, isTyping]);
+  }, [messages, isTyping, recovery]);
+
+  useEffect(() => {
+    if (!showRecoveryBanner) return undefined;
+    const timer = setTimeout(() => setShowRecoveryBanner(false), 6000);
+    return () => clearTimeout(timer);
+  }, [showRecoveryBanner]);
 
   useEffect(() => {
     if (!showSOSOverlay) {
@@ -179,8 +231,11 @@ export default function PatientChat({ sessionId, patientMood }) {
     try {
       const analysisResult = await analyzeMessage(userMessage, sessionId);
       setAnalysis(analysisResult);
-      setSurface(TIER_SURFACES[analysisResult.risk_tier?.tier] || TIER_SURFACES.safe);
-      socket.send({ content: userMessage, analysis: analysisResult });
+      socket.send({
+        content: userMessage,
+        analysis: analysisResult,
+        timestamp: new Date().toISOString(),
+      });
 
       if (analysisResult.silent_signal) {
         setSilentSignal({
@@ -192,7 +247,6 @@ export default function PatientChat({ sessionId, patientMood }) {
           "assistant",
           "I notice you have gone a bit quiet. You do not have to share anything you are not ready to. I am here."
         );
-        setIsTyping(false);
         return;
       }
 
@@ -220,6 +274,8 @@ export default function PatientChat({ sessionId, patientMood }) {
             riskTier: analysisResult.risk_tier?.tier,
           });
         }
+      } else if (sessionMode === "copilot") {
+        addSystemMessage("A counselor is quietly co-piloting this conversation.");
       }
     } catch (error) {
       addMessage("system", "Connection issue. Please try again in a moment.");
@@ -233,20 +289,13 @@ export default function PatientChat({ sessionId, patientMood }) {
     setShowSOSOverlay(true);
   }
 
-  const currentTechnique = analysis?.technique || "ROGERIAN";
-  const currentTechniqueColor =
-    analysis?.technique_color ||
-    TECHNIQUE_COLORS[currentTechnique] ||
-    "#A855F7";
-  const detectedMood = deriveCurrentMood(analysis, patientMood);
-
   return (
     <div
+      className="nafsia-patient-page"
       style={{
         ...styles.page,
-        backgroundColor: surface.base,
-        backgroundImage: `${surface.glow}, radial-gradient(circle at top right, rgba(168, 85, 247, 0.12), transparent 20%), linear-gradient(180deg, rgba(255,255,255,0.58), rgba(255,255,255,0.38))`,
-        transition: "background-color 1.5s ease",
+        backgroundColor: scene.shellTint,
+        backgroundImage: scene.roomGradient,
       }}
     >
       <style>{`
@@ -258,6 +307,8 @@ export default function PatientChat({ sessionId, patientMood }) {
         }
       `}</style>
 
+      <WeatherLayer scene={scene} />
+
       <div style={styles.leftPane}>
         <div style={styles.header}>
           <div style={styles.headerInner}>
@@ -266,20 +317,36 @@ export default function PatientChat({ sessionId, patientMood }) {
               <div style={styles.subtleMeta}>Private patient channel</div>
             </div>
 
-            <div
-              style={{
-                ...styles.techniqueBadge,
-                background: currentTechniqueColor + "16",
-                color: currentTechniqueColor,
-              }}
-            >
-              {currentTechnique}
+            <div style={styles.headerCenter}>
+              <div
+                style={{
+                  ...styles.weatherBadge,
+                  background: scene.accent + "18",
+                  color: scene.accent,
+                }}
+              >
+                {scene.weatherLabel}
+              </div>
+              <div
+                style={{
+                  ...styles.techniqueBadge,
+                  background: scene.techniqueGlow + "18",
+                  color: scene.techniqueGlow,
+                }}
+              >
+                {scene.technique}
+              </div>
             </div>
 
             <div style={styles.headerActions}>
-              {sessionMode === "human" ? (
-                <div style={styles.modeIndicator}>Human counselor active</div>
-              ) : null}
+              <div
+                style={{
+                  ...styles.modeBadge,
+                  color: scene.mode === "human" ? "#7dd3fc" : scene.mode === "copilot" ? "#f4d27a" : "#8ea0bf",
+                }}
+              >
+                {scene.modeTitle}
+              </div>
               <button onClick={handleSOS} style={styles.sosButton}>
                 SOS
               </button>
@@ -298,14 +365,48 @@ export default function PatientChat({ sessionId, patientMood }) {
 
         <div style={styles.messagesArea}>
           <div style={styles.messagesInner}>
-            <div style={styles.introCard}>
-              <div style={styles.introEyebrow}>Session in progress</div>
-              <div style={styles.introTitle}>A calmer space to keep talking.</div>
-              <div style={styles.introText}>
-                Your conversation stays centered here while live emotional
-                signals update quietly on the right.
+            <div
+              style={{
+                ...styles.weatherRoomCard,
+                background: scene.panelTint,
+                borderColor: scene.accent + "22",
+              }}
+            >
+              <div style={styles.roomEyebrow}>Emotional Weather Room</div>
+              <div style={styles.roomTitle}>{scene.weatherLabel}</div>
+              <div style={styles.roomText}>
+                The room shifts with risk, velocity, and intervention mode so
+                the session feels visibly alive instead of flat.
               </div>
             </div>
+
+            <div style={styles.sessionArc}>
+              <div style={styles.arcLabel}>Session Arc</div>
+              {arcLines.map((line) => (
+                <div key={line} style={styles.arcLine}>
+                  {line}
+                </div>
+              ))}
+            </div>
+
+            {showRecoveryBanner ? (
+              <div style={styles.recoveryReadyBanner}>
+                <div>
+                  <div style={styles.recoveryReadyEyebrow}>Recovery Ready</div>
+                  <div style={styles.recoveryReadyText}>
+                    Your session has been translated into a calm next-step canvas.
+                  </div>
+                </div>
+                <button
+                  onClick={() =>
+                    recoveryRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                  style={styles.recoveryReadyButton}
+                >
+                  View Canvas
+                </button>
+              </div>
+            ) : null}
 
             {messages.map((message, index) => {
               if (message.role === "system") {
@@ -351,12 +452,18 @@ export default function PatientChat({ sessionId, patientMood }) {
                   <CopingSupport
                     copingEmotion={message.copingEmotion}
                     riskTier={message.riskTier}
+                    scene={scene}
                   />
                 </div>
               );
             })}
 
             {isTyping ? <TypingIndicator /> : null}
+            {recovery ? (
+              <div ref={recoveryRef}>
+                <RecoveryCanvas recovery={recovery} />
+              </div>
+            ) : null}
             <div ref={bottomRef} />
           </div>
         </div>
@@ -417,7 +524,11 @@ export default function PatientChat({ sessionId, patientMood }) {
         </div>
         <div style={styles.panelItem}>
           <span style={styles.panelLabel}>Mode</span>
-          <span style={styles.panelValue}>{sessionMode}</span>
+          <span style={styles.panelValue}>{scene.modeTitle}</span>
+        </div>
+        <div style={styles.panelItem}>
+          <span style={styles.panelLabel}>Timeline</span>
+          <span style={styles.panelValue}>{timelineEvents.length} events</span>
         </div>
       </div>
 
@@ -447,14 +558,37 @@ export default function PatientChat({ sessionId, patientMood }) {
 const styles = {
   page: {
     display: "flex",
-    height: "100vh",
+    minHeight: "100vh",
     color: "#0F172A",
+    position: "relative",
+    overflow: "hidden",
+  },
+  weatherBlob: {
+    position: "absolute",
+    top: 120,
+    left: 40,
+    width: 420,
+    height: 320,
+    borderRadius: "50%",
+    pointerEvents: "none",
+  },
+  weatherBeam: {
+    position: "absolute",
+    top: -80,
+    right: 260,
+    width: 280,
+    height: 520,
+    background: "linear-gradient(180deg, rgba(255,255,255,0.34), transparent)",
+    filter: "blur(14px)",
+    pointerEvents: "none",
   },
   leftPane: {
     flex: 1,
     display: "flex",
     flexDirection: "column",
     minWidth: 0,
+    position: "relative",
+    zIndex: 2,
   },
   header: {
     position: "sticky",
@@ -463,7 +597,7 @@ const styles = {
     padding: "18px 24px 10px",
   },
   headerInner: {
-    maxWidth: 920,
+    maxWidth: 980,
     margin: "0 auto",
     background: "rgba(8, 13, 27, 0.86)",
     border: "1px solid rgba(255,255,255,0.05)",
@@ -487,12 +621,23 @@ const styles = {
     fontSize: 12,
     marginTop: 4,
   },
+  headerCenter: {
+    display: "flex",
+    alignItems: "center",
+    gap: 10,
+  },
+  weatherBadge: {
+    padding: "10px 14px",
+    borderRadius: 999,
+    fontSize: 12,
+    fontWeight: "bold",
+    border: "1px solid rgba(255,255,255,0.06)",
+  },
   techniqueBadge: {
     padding: "10px 16px",
     borderRadius: 999,
     fontSize: 13,
     fontWeight: "bold",
-    letterSpacing: "0.06em",
     border: "1px solid rgba(255,255,255,0.06)",
   },
   headerActions: {
@@ -500,10 +645,11 @@ const styles = {
     alignItems: "center",
     gap: 12,
   },
-  modeIndicator: {
-    color: "#7dd3fc",
+  modeBadge: {
     fontSize: 12,
     fontWeight: "bold",
+    letterSpacing: "0.08em",
+    textTransform: "uppercase",
   },
   sosButton: {
     background: "linear-gradient(135deg, #ff6b6b 0%, #ff4444 100%)",
@@ -520,7 +666,7 @@ const styles = {
     padding: "0 24px 6px",
   },
   silentBanner: {
-    maxWidth: 920,
+    maxWidth: 980,
     margin: "0 auto",
     background: "rgba(255, 166, 92, 0.14)",
     color: "#8A4A12",
@@ -547,35 +693,90 @@ const styles = {
     padding: "6px 24px 120px",
   },
   messagesInner: {
-    maxWidth: 920,
+    maxWidth: 980,
     margin: "0 auto",
     display: "flex",
     flexDirection: "column",
     gap: 16,
   },
-  introCard: {
-    background: "rgba(255,255,255,0.42)",
-    border: "1px solid rgba(255,255,255,0.34)",
-    borderRadius: 24,
-    padding: "18px 20px",
+  weatherRoomCard: {
+    borderRadius: 28,
+    padding: "22px 24px",
+    border: "1px solid rgba(255,255,255,0.24)",
     boxShadow: "0 18px 40px rgba(72, 98, 132, 0.08)",
+    backdropFilter: "blur(10px)",
   },
-  introEyebrow: {
+  roomEyebrow: {
     fontSize: 11,
     letterSpacing: "0.12em",
     textTransform: "uppercase",
     color: "#4B647F",
     marginBottom: 8,
   },
-  introTitle: {
-    fontSize: 22,
+  roomTitle: {
+    fontSize: 30,
     fontWeight: "bold",
-    color: "#0B1A2E",
     marginBottom: 8,
+    color: "#0b1730",
   },
-  introText: {
+  roomText: {
     color: "#465A73",
     lineHeight: 1.7,
+  },
+  sessionArc: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+    gap: 12,
+  },
+  arcLabel: {
+    gridColumn: "1 / -1",
+    fontSize: 11,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "#4B647F",
+  },
+  arcLine: {
+    borderRadius: 18,
+    padding: "14px 16px",
+    background: "rgba(255,255,255,0.42)",
+    border: "1px solid rgba(255,255,255,0.32)",
+    color: "#3d5269",
+    minHeight: 66,
+    display: "flex",
+    alignItems: "center",
+  },
+  recoveryReadyBanner: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: 16,
+    borderRadius: 22,
+    padding: "16px 18px",
+    background: "rgba(8, 13, 27, 0.84)",
+    color: "#ffffff",
+    border: "1px solid rgba(125, 211, 252, 0.16)",
+    boxShadow: "0 20px 40px rgba(8, 13, 27, 0.12)",
+  },
+  recoveryReadyEyebrow: {
+    fontSize: 11,
+    letterSpacing: "0.12em",
+    textTransform: "uppercase",
+    color: "#87f5cf",
+    marginBottom: 6,
+  },
+  recoveryReadyText: {
+    color: "rgba(255,255,255,0.76)",
+    lineHeight: 1.6,
+  },
+  recoveryReadyButton: {
+    border: "none",
+    borderRadius: 999,
+    padding: "12px 18px",
+    background: "linear-gradient(135deg, #87f5cf 0%, #7dd3fc 100%)",
+    color: "#06111d",
+    fontWeight: "bold",
+    cursor: "pointer",
+    flexShrink: 0,
   },
   systemWrap: {
     display: "flex",
@@ -690,7 +891,7 @@ const styles = {
     backdropFilter: "blur(16px)",
   },
   inputInner: {
-    maxWidth: 920,
+    maxWidth: 980,
     margin: "0 auto",
     background: "rgba(8, 13, 27, 0.88)",
     border: "1px solid rgba(255,255,255,0.05)",
@@ -730,6 +931,8 @@ const styles = {
     flexDirection: "column",
     gap: 16,
     backdropFilter: "blur(18px)",
+    position: "relative",
+    zIndex: 2,
   },
   panelTitle: {
     fontSize: 18,
