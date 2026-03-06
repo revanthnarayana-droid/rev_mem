@@ -106,8 +106,14 @@ class SessionStore:
         s = self.get_session(session_id)
         if not s:
             return []
+        role_map = {
+            "patient": "user",
+            "user": "user",
+            "assistant": "assistant",
+            "counselor": "assistant",
+        }
         return [
-            {"role": m["role"], "content": m["content"]}
+            {"role": role_map.get(m["role"], "user"), "content": m["content"]}
             for m in s["messages"][-last_n:]
         ]
 

@@ -149,3 +149,4 @@ __pycache__/
 
 # Local demo workspace
 nafsia/backend/venv/
+nafsia/frontend/build/

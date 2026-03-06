@@ -4,8 +4,9 @@ from typing import List
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 
-from models.emotion_classifier import classify_emotion
-from models.stress_detector import detect_stress
+from models.emotion_classifier import classify_emotion, classify_emotion_heuristic
+from models.stress_detector import detect_stress, detect_stress_heuristic
+from models.suicide_detector import detect_suicide_risk, detect_suicide_risk_heuristic
 from models.psycho_analyzer import PsychoAnalyzer
 from models.velocity_tracker import VelocityTracker
 from models.technique_router import TechniqueRouter
@@ -19,6 +20,7 @@ executor = ThreadPoolExecutor(max_workers=4)
 psycho = PsychoAnalyzer()
 vt = VelocityTracker()
 tr = TechniqueRouter()
+MODEL_TIMEOUT_SECONDS = 3.5
 
 
 class AnalyzeRequest(BaseModel):
@@ -55,6 +57,41 @@ def _crisis_phrase_boost(text: str) -> float:
     return 7.8 if any(phrase in text_lower for phrase in crisis_phrases) else 0.0
 
 
+def _apply_crisis_overrides(emotion_result: dict, stress_result: dict, suicide_result: dict):
+    if suicide_result["label"] != "suicidal":
+        return emotion_result, stress_result
+
+    emotion_override = dict(emotion_result)
+    if emotion_override["top_emotion"] in {"neutral", "joy"}:
+        emotion_override["top_emotion"] = "sadness"
+        emotion_override["top_score"] = max(emotion_override["top_score"], suicide_result["score"])
+        emotion_override["risk_contribution"] = max(
+            emotion_override["risk_contribution"],
+            round(min(1.0, suicide_result["score"] * 0.95), 4),
+        )
+
+    stress_override = dict(stress_result)
+    stress_override["label"] = "stressed"
+    stress_override["intensity"] = max(stress_override["intensity"], suicide_result["score"])
+    stress_override["risk_contribution"] = max(
+        stress_override["risk_contribution"],
+        round(min(1.0, suicide_result["score"]), 4),
+    )
+
+    return emotion_override, stress_override
+
+
+async def _run_model(loop, fn, fallback_fn, text: str):
+    try:
+        return await asyncio.wait_for(
+            loop.run_in_executor(executor, fn, text),
+            timeout=MODEL_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        print(f"[NAFSIA] Timed fallback for {fn.__name__}: {exc}")
+        return fallback_fn(text)
+
+
 @router.post("/analyze")
 async def analyze(req: AnalyzeRequest):
     session = store.get_session(req.session_id)
@@ -66,17 +103,23 @@ async def analyze(req: AnalyzeRequest):
     message_metadata = session["message_metadata"]
 
     loop = asyncio.get_event_loop()
-    emotion_result, stress_result, psycho_result = await asyncio.gather(
-        loop.run_in_executor(executor, classify_emotion, req.message),
-        loop.run_in_executor(executor, detect_stress, req.message),
+    emotion_result, stress_result, psycho_result, suicide_result = await asyncio.gather(
+        _run_model(loop, classify_emotion, classify_emotion_heuristic, req.message),
+        _run_model(loop, detect_stress, detect_stress_heuristic, req.message),
         loop.run_in_executor(executor, psycho.analyze, req.message),
+        _run_model(loop, detect_suicide_risk, detect_suicide_risk_heuristic, req.message),
+    )
+    emotion_result, stress_result = _apply_crisis_overrides(
+        emotion_result, stress_result, suicide_result
     )
 
     risk_data = compute_full_risk(emotion_result, stress_result, psycho_result)
-    risk_score = max(risk_data["risk_score"], _crisis_phrase_boost(req.message))
+    suicide_boost = 8.8 if suicide_result["label"] == "suicidal" and suicide_result["score"] >= 0.65 else 0.0
+    risk_score = max(risk_data["risk_score"], _crisis_phrase_boost(req.message), suicide_boost)
     risk_data["risk_score"] = risk_score
     risk_data["risk_tier"] = get_risk_tier(risk_score)
-    updated_history = score_history + [risk_score]
+    prior_history = score_history if score_history else [session.get("baseline_score", 5.0)]
+    updated_history = prior_history + [risk_score]
     vel_data = vt.full_analysis(updated_history)
     tech_data = tr.select_technique(
         emotion_result["top_emotion"], emotion_result["top_score"],
@@ -89,6 +132,8 @@ async def analyze(req: AnalyzeRequest):
         "emotion_score": emotion_result["top_score"],
         "stress_label": stress_result["label"],
         "stress_intensity": stress_result["intensity"],
+        "suicide_label": suicide_result["label"],
+        "suicide_score": suicide_result["score"],
         "psycho_profile": psycho_result,
         "risk_score": risk_score,
         "risk_tier": risk_data["risk_tier"],
@@ -105,6 +150,8 @@ async def analyze(req: AnalyzeRequest):
         "silent_signal_reason": silent["reason"],
         "updated_score_history": updated_history,
     }
+
+    store.append_message(req.session_id, "patient", req.message, response)
 
     await manager.send_to_counselors(req.session_id, {
         "type": ANALYSIS_UPDATE,

@@ -28,11 +28,36 @@ export default function App() {
   }
 
   return (
-    <div style={{ fontFamily: "Georgia, serif" }}>
+    <div style={{ fontFamily: "'Georgia', serif" }}>
+      <style>{`
+        :root {
+          --nafsia-ink: #ecf3ff;
+          --nafsia-muted: #8ea0bf;
+          --nafsia-panel: rgba(13, 19, 35, 0.78);
+          --nafsia-line: rgba(153, 173, 214, 0.14);
+          --nafsia-shadow: 0 24px 80px rgba(0, 0, 0, 0.32);
+        }
+        * { box-sizing: border-box; }
+        html, body, #root { margin: 0; min-height: 100%; }
+        body {
+          background:
+            radial-gradient(circle at top left, rgba(74, 144, 226, 0.16), transparent 28%),
+            radial-gradient(circle at top right, rgba(197, 163, 255, 0.14), transparent 24%),
+            linear-gradient(180deg, #07101d 0%, #0a1222 52%, #050913 100%);
+          color: var(--nafsia-ink);
+        }
+        button, input, textarea { font: inherit; }
+      `}</style>
       {screen === "login" && <LoginScreen onLogin={handleLogin} />}
-      {screen === "moodcheckin" && <MoodCheckIn sessionId={sessionId} onMoodSelected={handleMoodSelected} />}
-      {screen === "chat" && <PatientChat sessionId={sessionId} patientMood={patientMood} />}
-      {screen === "counselor" && <CounselorDashboard counselorSessionId={sessionId} />}
+      {screen === "moodcheckin" && (
+        <MoodCheckIn sessionId={sessionId} onMoodSelected={handleMoodSelected} />
+      )}
+      {screen === "chat" && (
+        <PatientChat sessionId={sessionId} patientMood={patientMood} />
+      )}
+      {screen === "counselor" && (
+        <CounselorDashboard counselorSessionId={sessionId} />
+      )}
     </div>
   );
 }

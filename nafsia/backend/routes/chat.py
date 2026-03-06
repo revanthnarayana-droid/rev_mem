@@ -67,7 +67,10 @@ async def chat(req: ChatRequest):
     )
     response_text = completion.choices[0].message.content.strip()
 
-    store.append_message(req.session_id, "user", req.message)
+    session = store.get_session(req.session_id)
+    last_message = session["messages"][-1] if session and session["messages"] else None
+    if not last_message or last_message["role"] != "patient" or last_message["content"] != req.message:
+        store.append_message(req.session_id, "patient", req.message)
     store.append_message(req.session_id, "assistant", response_text)
 
     await manager.send_to_counselors(req.session_id, {

@@ -3,6 +3,30 @@ from transformers import pipeline
 _classifier = None
 
 
+def classify_emotion_heuristic(text: str) -> dict:
+    text_lower = text.lower()
+    rules = [
+        ("sadness", 0.96, ["hopeless", "worthless", "alone", "nobody cares", "empty"]),
+        ("fear", 0.92, ["afraid", "panic", "terrified", "scared", "anxious"]),
+        ("anger", 0.88, ["hate", "angry", "furious", "rage"]),
+        ("joy", 0.9, ["great", "happy", "excited", "grateful"]),
+    ]
+    for label, score, terms in rules:
+        if any(term in text_lower for term in terms):
+            return {
+                "top_emotion": label,
+                "top_score": score,
+                "all_scores": {label: score},
+                "risk_contribution": round(map_emotion_to_risk(label, score), 4),
+            }
+    return {
+        "top_emotion": "neutral",
+        "top_score": 0.72,
+        "all_scores": {"neutral": 0.72},
+        "risk_contribution": round(map_emotion_to_risk("neutral", 0.72), 4),
+    }
+
+
 def get_classifier():
     global _classifier
     if _classifier is None:
@@ -16,18 +40,22 @@ def get_classifier():
 
 
 def classify_emotion(text: str) -> dict:
-    raw = get_classifier()(text)
-    results = normalize_results(raw)
-    scores = {r["label"]: round(r["score"], 4) for r in results}
-    top = max(results, key=lambda x: x["score"])
-    return {
-        "top_emotion": top["label"],
-        "top_score": round(top["score"], 4),
-        "all_scores": scores,
-        "risk_contribution": round(
-            map_emotion_to_risk(top["label"], top["score"]), 4
-        ),
-    }
+    try:
+        raw = get_classifier()(text)
+        results = normalize_results(raw)
+        scores = {r["label"]: round(r["score"], 4) for r in results}
+        top = max(results, key=lambda x: x["score"])
+        return {
+            "top_emotion": top["label"],
+            "top_score": round(top["score"], 4),
+            "all_scores": scores,
+            "risk_contribution": round(
+                map_emotion_to_risk(top["label"], top["score"]), 4
+            ),
+        }
+    except Exception as exc:
+        print(f"[NAFSIA] Emotion classifier fallback: {exc}")
+        return classify_emotion_heuristic(text)
 
 
 def normalize_results(raw) -> list[dict]:

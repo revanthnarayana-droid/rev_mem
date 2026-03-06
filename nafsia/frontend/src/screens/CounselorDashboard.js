@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import {
   LineChart,
   Line,
@@ -85,19 +85,82 @@ export default function CounselorDashboard({ counselorSessionId }) {
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [alerts, setAlerts] = useState([]);
   const [soapNote, setSoapNote] = useState(null);
+  const alarmContextRef = useRef(null);
+  const alarmIntervalRef = useRef(null);
+  const alarmTimeoutRef = useRef(null);
+
+  function stopEmergencyAlarm() {
+    if (alarmIntervalRef.current) {
+      clearInterval(alarmIntervalRef.current);
+      alarmIntervalRef.current = null;
+    }
+    if (alarmTimeoutRef.current) {
+      clearTimeout(alarmTimeoutRef.current);
+      alarmTimeoutRef.current = null;
+    }
+  }
+
+  function beepOnce(context, startAt, duration, frequency) {
+    const oscillator = context.createOscillator();
+    const gain = context.createGain();
+    oscillator.type = "square";
+    oscillator.frequency.setValueAtTime(frequency, startAt);
+    gain.gain.setValueAtTime(0.0001, startAt);
+    gain.gain.exponentialRampToValueAtTime(0.22, startAt + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
+    oscillator.connect(gain);
+    gain.connect(context.destination);
+    oscillator.start(startAt);
+    oscillator.stop(startAt + duration + 0.02);
+  }
+
+  async function playEmergencyAlarm() {
+    stopEmergencyAlarm();
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+
+    if (!alarmContextRef.current) {
+      alarmContextRef.current = new AudioCtx();
+    }
+
+    const context = alarmContextRef.current;
+    if (context.state === "suspended") {
+      try {
+        await context.resume();
+      } catch (error) {
+        console.error("[NAFSIA] Unable to resume audio context", error);
+        return;
+      }
+    }
+
+    const triggerPattern = () => {
+      const now = context.currentTime;
+      beepOnce(context, now, 0.18, 880);
+      beepOnce(context, now + 0.24, 0.18, 660);
+      beepOnce(context, now + 0.48, 0.18, 880);
+    };
+
+    triggerPattern();
+    alarmIntervalRef.current = setInterval(triggerPattern, 1100);
+    alarmTimeoutRef.current = setTimeout(() => {
+      stopEmergencyAlarm();
+    }, 10000);
+  }
 
   function addAlert(data, severity) {
-    setAlerts((current) => [
-      {
-        id: Date.now() + Math.random(),
-        session_id: data.session_id,
-        severity,
-        reason: data.alert_reason || data.reason || "Alert received",
-        timestamp: new Date().toLocaleTimeString(),
-        preview: data.message_preview || "",
-      },
-      ...current,
-    ].slice(0, 30));
+    setAlerts((current) =>
+      [
+        {
+          id: Date.now() + Math.random(),
+          session_id: data.session_id,
+          severity,
+          reason: data.alert_reason || data.reason || "Alert received",
+          timestamp: new Date().toLocaleTimeString(),
+          preview: data.message_preview || "",
+        },
+        ...current,
+      ].slice(0, 30)
+    );
   }
 
   function updateAnalysis(data) {
@@ -165,26 +228,23 @@ export default function CounselorDashboard({ counselorSessionId }) {
       addAlert(data, "crisis");
       setActiveSessionId(data.session_id);
     });
-
     const offSilent = socket.on(WS_EVENTS.SILENT_SIGNAL, (data) => {
       addAlert(
         { session_id: data.session_id, alert_reason: data.reason, message_preview: "" },
         "silent"
       );
     });
-
     const offSOS = socket.on(WS_EVENTS.SOS_FIRED, (data) => {
       addAlert(data, "emergency");
+      playEmergencyAlarm();
       document.body.style.background = "#FF000022";
       setTimeout(() => {
         document.body.style.background = "";
       }, 3000);
     });
-
     const offSoap = socket.on(WS_EVENTS.SOAP_READY, (data) => {
       setSoapNote(data.soap);
     });
-
     const offEnded = socket.on(WS_EVENTS.SESSION_ENDED, (data) => {
       setSessions((current) => ({
         ...current,
@@ -213,6 +273,7 @@ export default function CounselorDashboard({ counselorSessionId }) {
       offSOS();
       offSoap();
       offEnded();
+      stopEmergencyAlarm();
       socket.disconnect();
     };
   }, []);
@@ -270,7 +331,9 @@ export default function CounselorDashboard({ counselorSessionId }) {
                 onClick={() => setActiveSessionId(session.session_id)}
                 style={{
                   ...styles.sessionCard,
-                  borderLeft: `4px solid ${activeSessionId === session.session_id ? tierColor : "#111128"}`,
+                  borderLeft: `4px solid ${
+                    activeSessionId === session.session_id ? tierColor : "#111128"
+                  }`,
                   opacity: session.ended ? 0.6 : 1,
                 }}
               >
@@ -300,13 +363,7 @@ export default function CounselorDashboard({ counselorSessionId }) {
                 <ReferenceLine y={7.5} stroke="#FF4444" strokeDasharray="6 4" label="Crisis" />
                 <ReferenceLine y={4.0} stroke="#FFDD00" strokeDasharray="6 4" label="Watch" />
                 <Line dataKey="score" stroke="#FF3CAC" strokeWidth={2} dot={{ r: 3 }} />
-                <Line
-                  dataKey="velocity"
-                  stroke="#4DFFFF"
-                  strokeWidth={1}
-                  strokeDasharray="3 3"
-                  dot={false}
-                />
+                <Line dataKey="velocity" stroke="#4DFFFF" strokeWidth={1} strokeDasharray="3 3" dot={false} />
               </LineChart>
             </ResponsiveContainer>
           ) : (
@@ -319,7 +376,7 @@ export default function CounselorDashboard({ counselorSessionId }) {
         <div style={styles.controlsRow}>
           <div style={styles.controlsMeta}>
             <span>Session: {activeSession?.session_id || "--"}</span>
-            <span style={{ color: activeSession?.mode === "human" ? "#4DFFFF" : "#94A3B8" }}>
+            <span style={{ color: activeSession?.mode === "human" ? "#7dd3fc" : "#94A3B8" }}>
               {activeSession?.mode === "human" ? "Human counselor" : "AI mode"}
             </span>
           </div>
@@ -339,7 +396,7 @@ export default function CounselorDashboard({ counselorSessionId }) {
               Hand back to AI
             </button>
             <button
-              style={{ ...styles.actionButton, background: "#A855F7", color: "#FFFFFF" }}
+              style={{ ...styles.actionButton, background: "#8b5cf6", color: "#FFFFFF" }}
               disabled={!activeSession}
               onClick={() => activeSession && handleEndSession(activeSession.session_id)}
             >
@@ -363,13 +420,9 @@ export default function CounselorDashboard({ counselorSessionId }) {
                 }}
               >
                 <div style={styles.feedTopRow}>
-                  <span style={{ ...styles.feedRole, color: tierColor }}>
-                    {message.role}
-                  </span>
+                  <span style={{ ...styles.feedRole, color: tierColor }}>{message.role}</span>
                   {message.role === "patient" && message.analysis?.risk_score != null ? (
-                    <span style={styles.feedRisk}>
-                      {message.analysis.risk_score}
-                    </span>
+                    <span style={styles.feedRisk}>{message.analysis.risk_score}</span>
                   ) : null}
                 </div>
                 <div style={styles.feedContent}>{message.content}</div>
@@ -458,16 +511,18 @@ const styles = {
   page: {
     display: "flex",
     height: "100vh",
-    background: "#05050E",
+    background:
+      "radial-gradient(circle at top left, rgba(125, 211, 252, 0.08), transparent 22%), linear-gradient(180deg, #060a14 0%, #090f1d 100%)",
     color: "#FFFFFF",
     fontFamily: "monospace",
   },
   leftColumn: {
     width: 240,
-    borderRight: "1px solid #111128",
-    background: "#08081A",
+    borderRight: "1px solid rgba(143, 163, 196, 0.12)",
+    background: "rgba(8, 13, 27, 0.78)",
     display: "flex",
     flexDirection: "column",
+    backdropFilter: "blur(18px)",
   },
   centerColumn: {
     flex: 1,
@@ -477,14 +532,15 @@ const styles = {
   },
   rightColumn: {
     width: 280,
-    borderLeft: "1px solid #111128",
-    background: "#08081A",
+    borderLeft: "1px solid rgba(143, 163, 196, 0.12)",
+    background: "rgba(8, 13, 27, 0.78)",
     display: "flex",
     flexDirection: "column",
+    backdropFilter: "blur(18px)",
   },
   columnHeader: {
     padding: "18px 16px",
-    borderBottom: "1px solid #111128",
+    borderBottom: "1px solid rgba(143, 163, 196, 0.12)",
     fontWeight: "bold",
     letterSpacing: "0.08em",
     display: "flex",
@@ -492,7 +548,7 @@ const styles = {
     alignItems: "center",
   },
   headerCount: {
-    color: "#4DFFFF",
+    color: "#7dd3fc",
   },
   sessionList: {
     overflowY: "auto",
@@ -502,12 +558,14 @@ const styles = {
     gap: 10,
   },
   sessionCard: {
-    background: "#0D0D22",
-    border: "1px solid #15152E",
+    background: "rgba(15, 21, 38, 0.82)",
+    border: "1px solid rgba(143, 163, 196, 0.12)",
     color: "#FFFFFF",
     padding: 14,
     textAlign: "left",
     cursor: "pointer",
+    borderRadius: 18,
+    boxShadow: "0 14px 36px rgba(0, 0, 0, 0.16)",
   },
   sessionId: {
     fontWeight: "bold",
@@ -527,10 +585,11 @@ const styles = {
     letterSpacing: "0.08em",
   },
   ekgSection: {
-    background: "#0D0D22",
-    borderBottom: "1px solid #111128",
+    background: "rgba(11, 17, 31, 0.82)",
+    borderBottom: "1px solid rgba(143, 163, 196, 0.12)",
     padding: 16,
     minHeight: 210,
+    backdropFilter: "blur(18px)",
   },
   sectionLabel: {
     color: "#94A3B8",
@@ -546,8 +605,8 @@ const styles = {
     color: "#475569",
   },
   controlsRow: {
-    background: "#0D0D22",
-    borderBottom: "1px solid #111128",
+    background: "rgba(11, 17, 31, 0.82)",
+    borderBottom: "1px solid rgba(143, 163, 196, 0.12)",
     padding: "10px 16px",
     display: "flex",
     justifyContent: "space-between",
@@ -567,11 +626,12 @@ const styles = {
     flexWrap: "wrap",
   },
   actionButton: {
-    background: "#151530",
+    background: "rgba(20, 28, 48, 0.96)",
     color: "#FFFFFF",
-    border: "1px solid #22224A",
+    border: "1px solid rgba(143, 163, 196, 0.14)",
     padding: "8px 12px",
     cursor: "pointer",
+    borderRadius: 14,
   },
   conversationFeed: {
     flex: 1,
@@ -584,6 +644,8 @@ const styles = {
   },
   feedMessage: {
     padding: 14,
+    borderRadius: 18,
+    boxShadow: "0 14px 34px rgba(0, 0, 0, 0.12)",
   },
   feedTopRow: {
     display: "flex",
@@ -617,11 +679,12 @@ const styles = {
     border: "1px solid #FF444444",
     fontSize: 11,
     padding: "4px 6px",
+    borderRadius: 999,
   },
   soapSection: {
-    borderTop: "1px solid #A855F7",
+    borderTop: "1px solid rgba(197, 163, 255, 0.45)",
     padding: 16,
-    background: "#0D0D22",
+    background: "rgba(11, 17, 31, 0.82)",
     maxHeight: 280,
     overflowY: "auto",
   },
@@ -652,8 +715,10 @@ const styles = {
     gap: 10,
   },
   alertCard: {
-    background: "#0D0D22",
+    background: "rgba(15, 21, 38, 0.82)",
     padding: 12,
+    borderRadius: 16,
+    boxShadow: "0 12px 30px rgba(0, 0, 0, 0.14)",
   },
   alertHeader: {
     display: "flex",
@@ -667,6 +732,7 @@ const styles = {
     fontWeight: "bold",
     padding: "3px 6px",
     textTransform: "uppercase",
+    borderRadius: 999,
   },
   alertTime: {
     color: "#94A3B8",
@@ -684,11 +750,11 @@ const styles = {
     marginBottom: 6,
   },
   alertSession: {
-    color: "#4DFFFF",
+    color: "#7dd3fc",
     fontSize: 12,
   },
   miniPanel: {
-    borderTop: "1px solid #111128",
+    borderTop: "1px solid rgba(143, 163, 196, 0.12)",
     padding: 16,
   },
   miniRisk: {
